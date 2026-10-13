@@ -1,0 +1,1035 @@
+//RUNAS//
+// AutoInstall_Aardio - aardio版自动安装脚本
+// 支持 uuyc / AweSun 自动安装、登录、复制识别码、发送邮件；火绒按要求不安装（仅检测报警）
+
+import console;
+import winex;
+import mouse;
+import key;
+import win;
+import win.ui;
+import process;
+import process.popen;
+import fsys;
+import string;
+import time;
+import dotNet;
+import io;
+import win.clip;
+
+// 从外部配置文件加载（config.aardio 不纳入版本控制）
+var cfgPath = io.fullpath("/config.aardio");
+if(!io.exist(cfgPath)){
+    console.log("错误：配置文件 config.aardio 不存在");
+    console.log("请复制 config.example.aardio 为 config.aardio 并填写实际配置后再运行");
+    return;
+}
+import config;
+CFG = config.CFG;
+
+appDir = io.fullpath("/");
+if(string.match(appDir, "\\$")) appDir = string.left(appDir, #appDir-1);
+rootDir = null;
+var parentDir = io.splitpath(appDir).dir;
+if(string.match(parentDir, "\\$")) parentDir = string.left(parentDir, #parentDir-1);
+var cands = { appDir; parentDir; "D:\SysIns" };
+for(k=1; #cands; 1){
+    if(io.exist(cands[k] .. "\Soft\uuyc_4.42.0.exe")){
+        rootDir = cands[k];
+        break;
+    }
+}
+if(!rootDir){
+    console.log("错误：找不到 Soft 目录");
+    console.pause();
+    return;
+}
+
+softDir  = rootDir .. "\Soft";
+toolsDir = rootDir .. "\Tools";
+logDir   = rootDir .. "\Logs";
+fsys.createDir(logDir);
+
+ffmpeg  = toolsDir .. "\ffmpeg.exe";
+uuycExe = softDir .. "\uuyc_4.42.0.exe";
+awsunExe = softDir .. "\AweSun_16.6.0.32198.exe";
+
+ts = time(, "%Y%m%d%H%M%S");
+logFile = logDir .. "\AutoInstall-" .. ts .. ".log";
+
+LOG = function(...){
+    var parts = {...};
+    var s = time(, "%H:%M:%S");
+    for(k=1;#parts) s = s .. "  " .. tostring(parts[k]);
+    console.log(s);
+    string.save(logFile, s .. '\r\n', true);
+}
+
+HUORONG_PROCS = {"hipstray.exe"; "hipsmain.exe"; "hipsdaemon.exe"; "hrconfig.exe"};
+HUORONG_SVCS = {"HipsDaemon"; "sysdiag"};
+
+CHECK_HUORONG = function(){
+	var pr = process.popen("tasklist.exe");
+	if(pr){
+		var out = string.lower(pr.readAll());
+		for(k=1; #HUORONG_PROCS; 1){
+			if(string.find(out, HUORONG_PROCS[k])) return HUORONG_PROCS[k];
+		}
+	}
+	for(k=1; #HUORONG_SVCS; 1){
+		var ps = process.popen("sc.exe", {"query"; HUORONG_SVCS[k]});
+		if(ps){
+			var so, se, scode = ps.readAll();
+			if(scode == 0 && string.find(string.lower(so or ""), "running")) return HUORONG_SVCS[k];
+		}
+	}
+	return null;
+}
+
+recPrcs = null;
+
+REC_ARGS = function(hwnd, path){
+	var geo = {};
+	if(hwnd){
+		var r = win.getRect(hwnd);
+		var w = r.right-r.left; var h = r.bottom-r.top;
+		if(w >= 100 && h >= 100){
+			w = w - (w % 2); h = h - (h % 2);
+			geo = {"-offset_x"; tostring(r.left); "-offset_y"; tostring(r.top); "-video_size"; w .. "x" .. h};
+			LOG("录屏区域:", r.left, ",", r.top, " ", w, "x", h);
+		}
+	}
+	var a = {"-y"; "-threads"; "2"; "-thread_queue_size"; "64"; "-loglevel"; "error";
+		"-f"; "gdigrab"; "-framerate"; "5"; "-draw_mouse"; "1"};
+	for(k=1; #geo; 1) table.push(a, geo[k]);
+	table.push(a, "-i"); table.push(a, "desktop");
+	return a, path;
+}
+
+REC_LAUNCH = function(args, codec, path){
+	var full = {};
+	for(k=1; #args; 1) table.push(full, args[k]);
+	for(k=1; #codec; 1) table.push(full, codec[k]);
+	table.push(full, "-pix_fmt"); table.push(full, "yuv420p");
+	table.push(full, "-an"); table.push(full, path);
+	var pr = process.popen(ffmpeg, full);
+	if(!pr){ LOG("录屏启动失败"); return null }
+	sleep(1500);
+	if(!pr.stillActive()){ LOG("录屏进程立即退出"); return null }
+	LOG("录屏开始 ->", path);
+	return pr;
+}
+
+START_REC = function(hwnd, tag){
+	if(!CFG.record) return;
+	if(!io.exist(ffmpeg)){ LOG("ffmpeg 不存在，跳过录屏"); return }
+	var path = logDir .. "\AutoInstallRec-" .. ts .. "-" .. tag .. "_" .. CFG.lang .. ".mkv";
+	var args = REC_ARGS(hwnd, path);
+	recPrcs = REC_LAUNCH(args, {"-c:v"; "libx264"; "-preset"; "ultrafast"; "-crf"; "26"}, path);
+}
+
+STOP_REC = function(){
+	if(recPrcs){
+		recPrcs.write("q");
+		var tk = GET_TICK();
+		while(recPrcs.stillActive() && GET_TICK()-tk < 8000){ sleep(200); }
+		if(recPrcs.stillActive()) process(, "taskkill /f /im ffmpeg.exe");
+		sleep(500);
+		recPrcs = null;
+		LOG("录屏结束");
+	}
+}
+
+SWITCH_REC = function(hwnd, tag){
+	if(!CFG.record) return;
+	STOP_REC();
+	START_REC(hwnd, tag);
+}
+
+RESUME_PATH = function(){ return logDir .. "\resume_" .. CFG.lang .. ".txt" }
+
+TASK_NAME = "SysInsAutoInstall_" .. CFG.lang;
+
+GET_TICK = function(){ return ::Kernel32.GetTickCount64(); }
+
+RESUME_SAVE = function(mode, tick){
+	fsys.createDir(logDir);
+	string.save(RESUME_PATH(), mode .. '\n' .. tostring(tick));
+	LOG("续跑状态已保存:", mode, "tick=", tick);
+}
+
+RESUME_READ_MODE = function(){
+	if(!io.exist(RESUME_PATH())) return null;
+	var m = string.load(RESUME_PATH());
+	var nl = string.find(m, '\n');
+	if(nl) return string.trim(string.left(m, nl-1));
+	return string.trim(m);
+}
+
+RESUME_READ_TICK = function(){
+	if(!io.exist(RESUME_PATH())) return 0;
+	var m = string.load(RESUME_PATH());
+	var nl = string.find(m, '\n');
+	if(!nl) return 0;
+	var t = string.trim(string.slice(m, nl+1));
+	return tonumber(t) ?: 0;
+}
+
+RESUME_CLEAR = function(){
+	if(io.exist(RESUME_PATH())) fsys.delete(RESUME_PATH());
+}
+
+RESUME_TASK = function(mode){
+	var exe = io._exepath;
+	var tr = '"' .. '\"' .. exe .. '\" -resume' .. '"';
+	var pr = process.popen("schtasks.exe", {
+		"/create"; "/tn"; TASK_NAME; "/tr"; tr;
+		"/sc"; "onlogon"; "/rl"; "highest"; "/f";
+	});
+	var code, done = pr.getExitCode();
+	LOG("计划任务创建 rc=", code, ":", TASK_NAME);
+	RESUME_SAVE(mode, GET_TICK());
+}
+
+RESUME_TASK_DEL = function(){
+	var pr = process.popen("schtasks.exe", {"/delete"; "/tn"; TASK_NAME; "/f"});
+	pr.waitOne(10000);
+}
+
+CHECK_RESUME = function(){
+	var mode = RESUME_READ_MODE();
+	if(!mode) return null;
+	var nowTick = GET_TICK();
+	var savedTick = RESUME_READ_TICK();
+	if(nowTick < savedTick){
+		LOG("重启已确认（tick", nowTick, "<", savedTick, "），续跑:", mode);
+		RESUME_TASK_DEL(); RESUME_CLEAR();
+		return mode;
+	}
+	LOG("续跑在关机过程中被触发（tick", nowTick, ">=", savedTick, "），不执行任何操作，等待真正重启");
+	return false;
+}
+
+DO_REBOOT = function(){
+	LOG("系统即将重启（卸载sysdiag后必须重启才能重装）...");
+	process(, 'shutdown /r /t 10 /c "SysIns: sysdiag已卸载，重启后继续自动安装"');
+}
+
+SHOT = function(name){
+    import gdip.snap;
+    var p = logDir .. "\" .. name .. ".png";
+    try{ gdip.snap.file(p, 0); }catch(e){ }
+}
+
+FORCE_FG = function(hwnd){
+    if(win.isIconic(hwnd)) win.show(hwnd, 9);
+    sleep(200);
+    var ok = false;
+    for(i=1;2;1){
+        var tid = win.getThreadProcessId(hwnd);
+        var tidSelf = ::Kernel32.GetCurrentThreadId();
+        winex.AttachThreadInput(tidSelf, tid, 1);
+        win.setTopmost(hwnd, true);
+        win.setForeground(hwnd);
+        sleep(400);
+        winex.AttachThreadInput(tidSelf, tid, 0);
+        if(win.getForeground() == hwnd){ ok = true; break; }
+        sleep(300);
+    }
+    win.setTopmost(hwnd, false);
+    if(!ok) LOG("警告：窗口未能置前:", hwnd);
+    return ok;
+}
+
+KILL_STALE = function(){
+    var names = { "GameViewer.exe"; "sysdiag_setup.exe"; "Sysdiag_setup.exe";
+        "SunloginClient.exe"; "AweSun.exe"; "usysdiag.exe";
+        "sysdiag-all-x64-6.0.12.1-2026.09.22.1.exe"; "uuyc_4.42.0.exe"; "AweSun_16.6.0.32198.exe" };
+    for(k=1; #names; 1){
+        process(, "taskkill /f /im " .. names[k]);
+    }
+    sleep(1500);
+}
+
+MK_DLL = function(n){ return string.load(toolsDir .. "\mailkit\" .. n); }
+MK_LOADED = false;
+
+LOAD_MAILKIT = function(){
+    if(MK_LOADED) return true;
+    dotNet.reference({
+        "BouncyCastle.Cryptography" = MK_DLL("BouncyCastle.Cryptography.dll");
+        "System.Buffers" = MK_DLL("System.Buffers.dll");
+        "System.Formats.Asn1" = MK_DLL("System.Formats.Asn1.dll");
+        "System.Memory" = MK_DLL("System.Memory.dll");
+        "System.Numerics.Vectors" = MK_DLL("System.Numerics.Vectors.dll");
+        "System.Runtime.CompilerServices.Unsafe" = MK_DLL("System.Runtime.CompilerServices.Unsafe.dll");
+        "System.Threading.Tasks.Extensions" = MK_DLL("System.Threading.Tasks.Extensions.dll");
+        "System.ValueTuple" = MK_DLL("System.ValueTuple.dll");
+        "MimeKit" = MK_DLL("MimeKit.dll");
+        "MailKit" = MK_DLL("MailKit.dll");
+    });
+    var mailDir = toolsDir .. "\mailkit\";
+    var asmMailKit = dotNet.loadFile(mailDir .. "MailKit.dll");
+    asmMailKit.import("MailKit");
+    asmMailKit.import("MailKit.Net.Imap");
+    asmMailKit.import("MailKit.Net.Smtp");
+    asmMailKit.import("MailKit.Search");
+    var asmMime = dotNet.loadFile(mailDir .. "MimeKit.dll");
+    asmMime.import("MimeKit");
+    MK_LOADED = true;
+    return true;
+}
+
+MK = null;
+
+MK_CONNECT = function(){
+    LOAD_MAILKIT();
+    var client = MailKit.Net.Imap.ImapClient();
+    client.SslProtocols = 3072;
+    client.ServerCertificateValidationCallback = function(sender, certificate, chain, errors){ return true; }
+    client.Connect(CFG.imapHost, CFG.imapPort, true);
+    client.Authenticate(CFG.imapUser, CFG.imapPwd);
+    var inbox = client.Inbox;
+    inbox.Open(MailKit.FolderAccess.ReadOnly);
+    LOG("MailKit IMAP 已连接，收件箱邮件数:", inbox.Count);
+    MK = {client = client; inbox = inbox};
+    return true;
+}
+
+MK_DISCONNECT = function(){
+    if(MK){ try{ MK.client.Disconnect(true); } MK = null; }
+}
+
+MK_MAX_UID = function(results){
+    var maxId = 0; var maxUid = null;
+    for(k=1; results.Count; 1){
+        var uid = results[k];
+        var id = uid.Id;
+        if(id > maxId){ maxId = id; maxUid = uid; }
+    }
+    return maxId, maxUid;
+}
+
+FETCH_CODE = function(){
+    if(!MK){ if(!MK_CONNECT()){ LOG("错误：MailKit 连接失败"); return null } }
+    var inbox = MK.inbox;
+    var baseResults = null;
+    try { baseResults = inbox.Search(MailKit.Search.SearchQuery.SubjectContains(CFG.subjectKw)); }
+    catch(e){ LOG("IMAP 连接已断开，重连:", e); MK_DISCONNECT(); if(!MK_CONNECT()){ LOG("错误：MailKit 重连失败"); return null } inbox = MK.inbox; baseResults = inbox.Search(MailKit.Search.SearchQuery.SubjectContains(CFG.subjectKw)); }
+    var baseId = MK_MAX_UID(baseResults);
+    LOG("等待新验证码邮件，基线 UID:", baseId);
+    var code = null;
+    for(attempt=1; 30; 1){
+        sleep(5000);
+        try {
+            var results = inbox.Search(MailKit.Search.SearchQuery.SubjectContains(CFG.subjectKw));
+            var newId, newUid = MK_MAX_UID(results);
+            if(newUid && newId > baseId){
+                var msg = inbox.GetMessage(newUid);
+                var body = msg.TextBody;
+                if(!body) body = msg.HtmlBody;
+                LOG("新邮件:", msg.Subject);
+                if(body){
+                    code = string.match(body, "\d{6}");
+                }
+                if(!code) baseId = newId;
+            }
+        }
+        catch(e){ LOG("IMAP 轮询异常，重连:", e); MK_DISCONNECT(); if(!MK_CONNECT()){ LOG("错误：MailKit 重连失败"); return null } inbox = MK.inbox; }
+        if(code) break;
+    }
+    if(code){ LOG("提取到验证码:", code); return code; }
+    LOG("等待验证码超时");
+    return null;
+}
+
+SEND_MAIL = function(softName, body, attachPath){
+    LOG("发送邮件:", softName);
+    LOAD_MAILKIT();
+    var msg = MimeKit.MimeMessage();
+    msg.From.Add(MimeKit.MailboxAddress("pcbbs", CFG.smtpUser));
+    msg.To.Add(MimeKit.MailboxAddress("yihuos", CFG.mailTo));
+    msg.Subject = "您的软件-" .. softName .. "安装成功，现附上截图。";
+    var builder = MimeKit.BodyBuilder();
+    builder.TextBody = body;
+    if(attachPath && io.exist(attachPath)) builder.Attachments.Add(attachPath);
+    msg.Body = builder.ToMessageBody();
+    var smtp = MailKit.Net.Smtp.SmtpClient();
+    smtp.SslProtocols = 3072;
+    smtp.Timeout = 60000;
+    smtp.ServerCertificateValidationCallback = function(sender, certificate, chain, errors){ return true; }
+    smtp.Connect(CFG.smtpHost, CFG.smtpPort, true);
+    smtp.Authenticate(CFG.smtpUser, CFG.smtpPwd);
+    smtp.Send(msg);
+    smtp.Disconnect(true);
+    LOG("邮件已发送:", msg.Subject);
+    return true;
+}
+
+INSTALL_UU = function(){
+    LOG("启动 UU 安装包:", uuycExe);
+    process(uuycExe);
+    winex.waitTimeout = 60000;
+    var hwnd = winex.wait("网易UU远程 安装");
+    if(!hwnd){ LOG("错误：找不到 UU 安装窗口"); return false }
+    LOG("安装窗口出现");
+    SWITCH_REC(hwnd, "uu-install");
+    var btnNext = winex.findEx(hwnd, , "Button", "下一步");
+    if(btnNext){ winex.click(btnNext); sleep(2000); }
+    var ed = winex.findEx(hwnd, , "Edit");
+    if(!ed){ LOG("错误：找不到路径输入框"); return false }
+    winex.setText(ed, CFG.uuycDir);
+    sleep(500);
+    var btnInst = winex.findEx(hwnd, , "Button", "安装");
+    if(!btnInst){ LOG("错误：找不到安装按钮"); return false }
+    winex.click(btnInst);
+    LOG("已点击安装，等待安装完成...");
+    winex.waitTimeout = 180000;
+    winex.waitClose(hwnd);
+    if(win.isWindow(hwnd)){ LOG("错误：安装窗口未关闭"); return false }
+    winex.waitTimeout = 120000;
+    var main = winex.wait("网易UU远程");
+    if(!main){ LOG("错误：UU 主窗口未出现"); return false }
+    LOG("UU 主窗口已启动");
+    SWITCH_REC(main, "uu-main");
+    FORCE_FG(main);
+    sleep(4000);
+    return true, main;
+}
+
+SKIP_GUIDE = function(){
+    for(i=1;6;1){
+        var gv = winex.find(, "GameViewer");
+        if(!gv) break;
+        var r = win.getRect(gv, true);
+        mouse.click(r.left + (r.right-r.left)*0.698, r.top + (r.bottom-r.top)*0.772, true);
+        sleep(1500);
+    }
+}
+
+OPEN_LOGIN = function(main){
+    var r = win.getRect(main, true);
+    mouse.click(r.left + (r.right-r.left)*0.629, r.top + (r.bottom-r.top)*0.763, true);
+    for(i=1;30;1){
+        sleep(1000);
+        var gv = null;
+        winex.enumTop(function(h){
+            if(win.isVisible(h) && string.find(win.getClass(h) or "", "Qt") && string.find(win.getText(h) or "", "GameViewer")){
+                var rr = win.getRect(h, true);
+                if(rr.right-rr.left > 100 && rr.bottom-rr.top > 100){ gv = h; return false; }
+            }
+        });
+        if(gv) return gv;
+    }
+    return null;
+}
+
+DISMISS_MODAL = function(known){
+    var extra = null;
+    winex.enumTop(function(h){
+        if(win.isVisible(h) && !known[h]){
+            var c = win.getClass(h);
+            if(string.find(c, "Qt")){ extra = h; return false; }
+        }
+    });
+    if(extra){
+        var er = win.getRect(extra, true);
+        LOG("检测到模态弹窗:", win.getClass(extra), "|", win.getText(extra), "|", er.left, er.top, er.right-er.left, "x", er.bottom-er.top);
+        FORCE_FG(extra);
+        key.press("ENTER");
+        sleep(1000);
+        return true;
+    }
+}
+
+DO_LOGIN = function(login, main){
+    FORCE_FG(login);
+    var r = win.getRect(login, true);
+    var W = r.right-r.left;
+    var H = r.bottom-r.top;
+    LOG("DO_LOGIN 登录窗 rect:", r.left, r.top, W, H, " fg=", win.getForeground() == login);
+    var PT = function(rx, ry){ return {x = r.left + W*rx; y = r.top + H*ry}; }
+    mouse.click(PT(0.5458, 0.6628));
+    sleep(800);
+    mouse.click(PT(0.7067, 0.3503));
+    sleep(600);
+    key.sendString(CFG.phone);
+    sleep(800);
+    SHOT("login_phone");
+    mouse.click(PT(0.8082, 0.4194));
+    sleep(2500);
+    SHOT("login_sendcode");
+    LOG("已请求验证码");
+    var known = {};
+    known[login] = true;
+    known[main] = true;
+    DISMISS_MODAL(known);
+    var code = FETCH_CODE();
+    if(!code){ LOG("错误：未获取到验证码"); return false }
+    LOG("收到验证码:", code);
+    FORCE_FG(login);
+    mouse.click(PT(0.6324, 0.4243));
+    sleep(500);
+    key.sendString(code);
+    sleep(1000);
+    SHOT("login_codein");
+    mouse.click(PT(0.7092, 0.5822));
+    for(i=1;15;1){
+        sleep(1000);
+        if(!win.isWindow(login)){
+            LOG("登录成功");
+            SHOT("login_done");
+            return true;
+        }
+    }
+    LOG("登录窗口仍在，登录可能失败");
+    SHOT("login_fail");
+    return false;
+}
+
+class BMIH {
+    INT biSize; INT biWidth; INT biHeight; WORD biPlanes; WORD biBitCount;
+    INT biCompression; INT biSizeImage; INT biXPelsPerMeter; INT biYPelsPerMeter; INT biClrUsed; INT biClrImportant;
+}
+
+CLICK_STD_DIALOG = function(){
+    var handled = false;
+    winex.enumTop(function(h){
+        if(win.isVisible(h) && win.getClass(h) == "#32770"){
+            var btn = winex.findEx(h, , "Button", "继续安装");
+            if(btn){ LOG("检测到目录非空对话框，点击继续安装"); winex.click(btn); handled = true; return false; }
+        }
+    });
+    if(handled) sleep(2000);
+    return handled;
+}
+
+SNAP_WNDS = function(){
+    var set = {};
+    winex.enumTop(function(h){ if(win.isVisible(h)) set[h] = true; });
+    return set;
+}
+
+FIND_NEW_WNDS = function(before, minW, minH){
+    var list = {};
+    winex.enumTop(function(h){
+        if(win.isVisible(h) && !before[h]){
+            var r = win.getRect(h, true);
+            var w = r.right-r.left; var hh = r.bottom-r.top;
+            if(w >= minW && hh >= minH){ table.push(list, {hwnd=h; cls=win.getClass(h); title=win.getText(h); w=w; h=hh}); }
+        }
+    });
+    return list;
+}
+
+FIND_BIGGEST_NEW = function(before, minW, minH){
+    var list = FIND_NEW_WNDS(before, minW, minH);
+    if(#list == 0) return null;
+    var best = list[1];
+    for(k=2; #list; 1){ if(list[k].w * list[k].h > best.w * best.h) best = list[k]; }
+    LOG("新窗口:", best.cls, "|", best.title, "|", best.w, "x", best.h);
+    return best.hwnd;
+}
+
+IS_UU_LOGINED = function(main){
+    var c = GETPIXEL_PT(main, 0.629, 0.763);
+    var rr = c & 0xFF;
+    var bb = (c >> 16) & 0xFF;
+    return !(bb > 180 && rr < 120);
+}
+
+COPY_UU_INFO = function(main){
+    import win.clip;
+    FORCE_FG(main);
+    var r = win.getRect(main, true);
+    var W = r.right-r.left; var H = r.bottom-r.top;
+    var PT = function(vx, vy){ return {x = r.left + W*vx/920; y = r.top + H*vy/680}; }
+    win.clip.write("__SYSINS_SENTINEL__");
+    sleep(300);
+    mouse.click(PT(100, 74));
+    sleep(1500);
+    mouse.click(PT(100, 153));
+    sleep(2500);
+    SHOT("uu_info_page");
+    mouse.click(PT(789, 256));
+    sleep(2000);
+    SHOT("uu_after_copy");
+    var c = win.clip.read();
+    if(c == "__SYSINS_SENTINEL__") c = null;
+    LOG("UU 复制结果:", c or "(空)");
+    return c;
+}
+
+GETPIXEL_PT = function(hwnd, rx, ry){
+    var r = win.getRect(hwnd, true);
+    var x = r.left + (r.right-r.left)*rx;
+    var y = r.top + (r.bottom-r.top)*ry;
+    var dc = ::User32.GetDC(0);
+    var c = ::Gdi32.GetPixel(dc, x, y);
+    ::User32.ReleaseDC(0, dc);
+    return c;
+}
+
+BRIGHTNESS = function(c){
+    if(c === null) return 0;
+    var rr = c & 0xFF; var gg = (c >> 8) & 0xFF; var bb = (c >> 16) & 0xFF;
+    return (rr + gg + bb) / 3;
+}
+
+DEAL_AWESUN_MODAL = function(){
+    var hit = false;
+    winex.enumTop(function(h){
+        if(win.isVisible(h)){
+            var c = win.getClass(h);
+            var r = win.getRect(h, true);
+            var ww = r.right-r.left; var hh = r.bottom-r.top;
+            if(string.find(c, "^ATL:") && ww>200 && ww<700 && hh>100 && hh<500){
+                LOG("检测到已安装版本确认框，点击确定");
+                FORCE_FG(h);
+                mouse.click(r.left + ww*0.32, r.top + hh*0.77, true);
+                hit = true; return false;
+            }
+            if(string.find(c, "OrayUI") && ww>300 && ww<700 && hh>120 && hh<300){
+                LOG("检测到 OrayUI 卸载确认框:", win.getText(h));
+                FORCE_FG(h);
+                mouse.click(r.left + ww*0.29, r.top + hh*0.78, true);
+                hit = true; return false;
+            }
+        }
+    });
+    if(hit) sleep(3000);
+    return hit;
+}
+
+FIND_AWSUN_MAIN = function(){
+    var found = null;
+    winex.enumTop(function(h){
+        if(win.isVisible(h) && string.find(win.getText(h), "向日葵") && string.find(win.getClass(h), "FLUTTER")){
+            found = h; return false;
+        }
+    });
+    return found;
+}
+
+INSTALL_AWSUN = function(){
+    var before = SNAP_WNDS();
+    LOG("启动 AweSun 安装包:", awsunExe);
+    process(awsunExe);
+    var hwnd = null;
+    var main = null;
+    var tk = time.tick();
+    while(time.tick()-tk < 60000){
+        main = FIND_AWSUN_MAIN();
+        if(main) break;
+        hwnd = FIND_BIGGEST_NEW(before, 500, 350);
+        if(hwnd && string.find(win.getClass(hwnd), "OrayUI")) break;
+        hwnd = null;
+        DEAL_AWESUN_MODAL();
+        sleep(1000);
+    }
+    if(main){
+        LOG("AweSun 已在运行，直接使用主窗口");
+        SWITCH_REC(main, "awesun-main");
+        FORCE_FG(main);
+        sleep(8000);
+        SHOT("awsun_main");
+        return main;
+    }
+    if(!hwnd){ LOG("错误：找不到 AweSun 安装窗口"); SHOT("awsun_no_installer"); return null; }
+    SHOT("awsun_installer");
+    SWITCH_REC(hwnd, "awesun-install");
+    FORCE_FG(hwnd);
+    var r = win.getRect(hwnd, true);
+    var W = r.right-r.left; var H = r.bottom-r.top;
+    LOG("安装窗口尺寸:", W, "x", H);
+    mouse.click(r.left + W*0.500, r.top + H*0.521, true);
+    LOG("已点击立即安装，等待安装完成...");
+    var main = null;
+    var entered = false;
+    tk = time.tick();
+    while(time.tick()-tk < 300000){
+        sleep(3000);
+        DEAL_AWESUN_MODAL();
+        main = FIND_AWSUN_MAIN();
+        if(main) break;
+        if(win.isWindow(hwnd)){
+            var nr = win.getRect(hwnd, true);
+            var nw2 = nr.right-nr.left; var nh2 = nr.bottom-nr.top;
+            if(nw2>800 && nh2>500 && BRIGHTNESS(GETPIXEL_PT(hwnd, 0.12, 0.13)) > 200){
+                LOG("检测到安装完成欢迎页，点击立即进入");
+                if(!entered){ SWITCH_REC(hwnd, "awesun-install"); entered = true; }
+                mouse.click(nr.left + nw2*0.5, nr.top + nh2*0.57, true);
+                sleep(8000);
+            }
+        }
+        else break;
+    }
+    if(!main){
+        var tk2 = time.tick();
+        while(time.tick()-tk2 < 30000){
+            DEAL_AWESUN_MODAL();
+            main = FIND_AWSUN_MAIN();
+            if(main) break;
+            sleep(1000);
+        }
+    }
+    if(!main){ LOG("错误：找不到 AweSun 主窗口"); SHOT("awsun_no_main"); return null; }
+    LOG("AweSun 主窗口出现");
+    SWITCH_REC(main, "awesun-main");
+    FORCE_FG(main);
+    sleep(8000);
+    SHOT("awsun_main");
+    return main;
+}
+
+LOGIN_AWSUN = function(main){
+    FORCE_FG(main);
+    var r = win.getRect(main, true);
+    var W = r.right-r.left; var H = r.bottom-r.top;
+    var PT = function(rx, ry){ return {x = r.left + W*rx; y = r.top + H*ry}; }
+    mouse.click(PT(0.075, 0.047));
+    sleep(2500);
+    SHOT("awsun_login_page");
+    if(BRIGHTNESS(GETPIXEL_PT(main, 0.60, 0.30)) < 180){
+        LOG("AweSun 已登录（检测到账号页特征），跳过登录流程");
+        mouse.click(PT(0.975, 0.045));
+        sleep(1000);
+        main = FIND_AWSUN_MAIN() or main;
+        FORCE_FG(main);
+        return true;
+    }
+    mouse.click(PT(0.433, 0.822));
+    sleep(800);
+    mouse.click(PT(0.578, 0.334));
+    sleep(600);
+    winex.say(CFG.phone, main);
+    sleep(800);
+    SHOT("awsun_phone_in");
+    mouse.click(PT(0.706, 0.419));
+    sleep(3000);
+    SHOT("awsun_sendcode");
+    LOG("已请求 AweSun 验证码");
+    var code = FETCH_CODE();
+    if(!code){ LOG("错误：AweSun 未获取到验证码"); return false }
+    LOG("收到 AweSun 验证码:", code);
+    mouse.click(PT(0.549, 0.419));
+    sleep(500);
+    winex.say(code, main);
+    sleep(1000);
+    SHOT("awsun_code_in");
+    mouse.click(PT(0.587, 0.533));
+    sleep(10000);
+    SHOT("awsun_after_login");
+    mouse.click(PT(0.785, 0.191));
+    sleep(1500);
+    mouse.click(PT(0.701, 0.377));
+    sleep(1500);
+    SHOT("awsun_popups_closed");
+    return true;
+}
+
+SET_AWSUN_PWD = function(main){
+    FORCE_FG(main);
+    var r = win.getRect(main, true);
+    var W = r.right-r.left; var H = r.bottom-r.top;
+    var PT = function(rx, ry){ return {x = r.left + W*rx; y = r.top + H*ry}; }
+    mouse.click(PT(0.310, 0.450));
+    sleep(2000);
+    SHOT("awsun_security_page");
+    mouse.click(PT(0.472, 0.454));
+    sleep(1000);
+    mouse.click(PT(0.637, 0.509));
+    sleep(500);
+    winex.say(CFG.awsunPwd, main);
+    sleep(600);
+    mouse.click(PT(0.637, 0.581));
+    sleep(500);
+    winex.say(CFG.awsunPwd, main);
+    sleep(600);
+    SHOT("awsun_pwd_in");
+    mouse.click(PT(0.521, 0.727));
+    sleep(2000);
+    SHOT("awsun_pwd_saved");
+}
+
+COPY_AWSUN_INFO = function(main){
+    import win.clip;
+    FORCE_FG(main);
+    var r = win.getRect(main, true);
+    var W = r.right-r.left; var H = r.bottom-r.top;
+    var PT = function(rx, ry, dx, dy){
+        return {x = r.left + W*rx + (dx ?: 0); y = r.top + H*ry + (dy ?: 0)};
+    }
+    mouse.click(PT(0.090, 0.155));
+    sleep(2000);
+    SHOT("awsun_info_page");
+    win.clip.write("__SYSINS_SENTINEL__");
+    sleep(300);
+    var SENTINEL = "__SYSINS_SENTINEL__";
+    var offs = { {0;0}; {0;-14}; {0;14}; {-16;0}; {16;0} };
+    var idClip = null;
+    for(k=1; #offs; 1){
+        if(idClip) break;
+        mouse.click(PT(0.522, 0.305, offs[k][1], offs[k][2]));
+        sleep(1500);
+        var c = win.clip.read();
+        if(c != SENTINEL && c && #c > 0) idClip = c;
+    }
+    var codeClip = null;
+    win.clip.write(SENTINEL);
+    sleep(300);
+    mouse.click(PT(0.712, 0.294));
+    sleep(1500);
+    var c = win.clip.read();
+    if(c != SENTINEL && c && #c > 0) codeClip = c;
+    if(!codeClip){
+        for(k=1; #offs; 1){
+            if(codeClip) break;
+            mouse.click(PT(0.755, 0.300, offs[k][1], offs[k][2]));
+            sleep(1500);
+            var c = win.clip.read();
+            if(c != SENTINEL && c && #c > 0) codeClip = c;
+        }
+    }
+    SHOT("awsun_copied");
+    LOG("AweSun 识别码剪贴板:", idClip or "(空)");
+    LOG("AweSun 验证码剪贴板:", codeClip or "(空)");
+    return idClip, codeClip;
+}
+
+UNINSTALL_MATCH = function(name, kind){
+	if(!name) return false;
+	var low = string.lower(name);
+	if(kind == "uu") return string.find(low, "uu远程") || string.find(low, "gameviewer");
+	if(kind == "aw") return string.find(name, "向日葵") || string.find(low, "awesun") || string.find(low, "sunlogin");
+	if(kind == "hr") return string.find(name, "火绒") || string.find(low, "huorong") || string.find(low, "sysdiag");
+	return false;
+}
+
+UNINSTALL_UI = function(seconds){
+	var tk = time.tick();
+	var okTexts = { "继续卸载"; "残忍卸载"; "确定"; "是"; "下一步"; "卸载" };
+	while(time.tick()-tk < seconds*1000){
+		var acted = false;
+		winex.enumTop(function(h){
+			if(acted) return;
+			if(!win.isVisible(h)) return;
+			var t = win.getText(h); var c = win.getClass(h);
+			if(c == "#32770" || string.find(c, "OrayUI") || string.find(c, "HUORONG") || string.find(t, "卸载")){
+				for(k=1; #okTexts; 1){
+					var b = winex.findEx(h, , "Button", okTexts[k]);
+					if(b){ LOG("卸载向导点击:", okTexts[k]); FORCE_FG(h); winex.click(b); acted = true; sleep(1500); break; }
+				}
+			}
+		});
+		if(!acted) sleep(1500);
+	}
+}
+
+SYS_REMOVED = false;
+
+UNINSTALL_ALL = function(){
+	LOG("================ 卸载阶段 ================");
+	import win.reg;
+	KILL_STALE();
+	var regPaths = {
+		"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+		"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+		"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+	};
+	var kinds = { "uu"; "aw"; "hr" };
+	for(ki=1; #kinds; 1){
+		var kind = kinds[ki];
+		for(pi=1; #regPaths; 1){
+			var parent = win.reg(regPaths[pi], true);
+			if(!parent) continue;
+			var subNames = parent.keys();
+			parent.close();
+			for(si=1; #subNames; 1){
+				var reg = win.reg(regPaths[pi] .. "\" .. subNames[si], true);
+				if(!reg) continue;
+				var dn = reg.queryValue("DisplayName");
+				if(dn && UNINSTALL_MATCH(dn, kind)){
+					LOG("发现已安装:", dn);
+					var cmd = reg.queryValue("QuietUninstallString");
+					if(!cmd) cmd = reg.queryValue("UninstallString");
+					reg.close();
+					if(cmd){
+						if(string.find(string.lower(cmd), "unins") && !string.find(cmd, "/")) cmd = cmd .. " /S";
+						LOG("执行卸载命令:", cmd);
+						var pr = process.popen("cmd.exe", {"/c"; cmd});
+						pr.waitOne(90000);
+						UNINSTALL_UI(60);
+						if(kind == "hr"){ SYS_REMOVED = true; LOG("sysdiag 已卸载，重装前必须重启系统"); }
+					}
+				}
+				else reg.close();
+			}
+		}
+	}
+	process(, "sc stop SunloginService"); process(, "sc delete SunloginService");
+	var svcs = { "HipsDaemon"; "HipsKeeper"; "HipsService" };
+	for(k=1; #svcs; 1){ process(, "sc stop " .. svcs[k]); process(, "sc delete " .. svcs[k]); }
+	sleep(3000);
+	KILL_STALE();
+	RMDIR = function(p){
+		if(io.exist(p)){
+			var pr = process.popen("cmd.exe", {"/c"; 'rmdir /s /q "' .. p .. '"'});
+			pr.waitOne(30000);
+			LOG("已删除目录:", p);
+		}
+	}
+	RMDIR(CFG.uuycDir); RMDIR("C:\Program Files\Oray"); RMDIR("C:\Program Files\Huorong");
+	LOG("卸载阶段完成");
+}
+
+console.log("================ SysIns aardio 自动安装 开始 ================");
+LOG("根目录:", rootDir);
+
+mode = "all";
+if(_ARGV){
+	if(_ARGV.resume !== null) mode = "resume";
+	elseif(_ARGV.uninstall !== null) mode = "uninstall";
+	elseif(_ARGV.sysdiag !== null) mode = "sysdiag";
+	elseif(_ARGV.uu !== null) mode = "uu";
+	elseif(_ARGV.awesun !== null) mode = "awesun";
+}
+
+if(mode == "resume"){
+	var pending = CHECK_RESUME();
+	if(pending === null){ LOG("无续跑状态，退出"); return }
+	if(pending === false){ return }
+	mode = pending;
+}
+elseif(io.exist(RESUME_PATH())){
+	var pending = CHECK_RESUME();
+	if(pending === false){ return }
+	if(pending) mode = pending;
+}
+
+if(mode != "uninstall" && mode != "sysdiag"){
+	var hrDetected = CHECK_HUORONG();
+	if(hrDetected){
+		LOG("检测到火绒安全软件正在运行（" .. hrDetected .. "），请先手动退出或卸载后再运行本脚本");
+		return 2;
+	}
+}
+
+START_REC(null, "boot");
+
+if(mode == "uninstall"){
+	UNINSTALL_ALL();
+	STOP_REC();
+	return;
+}
+
+if(mode == "sysdiag"){
+	UNINSTALL_ALL();
+	if(SYS_REMOVED){
+		RESUME_TASK("sysdiag2");
+		STOP_REC();
+		DO_REBOOT();
+		sleep(15000);
+		return;
+	}
+	STOP_REC();
+	return;
+}
+
+if(mode == "uu"){
+	var uuOk, mainHwnd = INSTALL_UU();
+	if(uuOk){
+		SKIP_GUIDE(); sleep(1000);
+		var loginOk = true;
+		if(IS_UU_LOGINED(mainHwnd)){
+			LOG("UU 已登录，跳过登录流程");
+		}
+		else{
+			var login = OPEN_LOGIN(mainHwnd);
+			if(login){ loginOk = DO_LOGIN(login, mainHwnd); }
+			else{ LOG("错误：登录窗口未打开"); loginOk = false; }
+		}
+		if(loginOk){ sleep(3000); uuClip = COPY_UU_INFO(mainHwnd); }
+	}
+	STOP_REC();
+	return;
+}
+
+if(mode == "awesun"){
+	var awMain = INSTALL_AWSUN();
+	if(awMain){
+		awLoginOk = LOGIN_AWSUN(awMain);
+		if(awLoginOk){ awId, awCode = COPY_AWSUN_INFO(awMain); }
+	}
+	STOP_REC();
+	return;
+}
+
+if(mode == "phase2" || mode == "sysdiag2"){
+	KILL_STALE();
+}
+else{
+	UNINSTALL_ALL();
+	if(SYS_REMOVED){
+		RESUME_TASK("phase2");
+		STOP_REC();
+		DO_REBOOT();
+		sleep(15000);
+		return;
+	}
+}
+
+var uuOk, mainHwnd = INSTALL_UU();
+var loginOk = false;
+var uuClip = null;
+if(uuOk){
+    SKIP_GUIDE();
+    sleep(1000);
+    if(IS_UU_LOGINED(mainHwnd)){
+        LOG("UU 已登录，跳过登录流程");
+        loginOk = true;
+    }
+    else{
+        var login = OPEN_LOGIN(mainHwnd);
+        if(login){ loginOk = DO_LOGIN(login, mainHwnd); }
+        else{ LOG("错误：登录窗口未打开"); loginOk = false; }
+    }
+    if(loginOk){ sleep(3000); uuClip = COPY_UU_INFO(mainHwnd); }
+}
+else{ LOG("UU 安装失败，跳过登录步骤"); }
+
+var awMain = INSTALL_AWSUN();
+var awLoginOk = false;
+var awId, awCode;
+if(awMain){
+    awLoginOk = LOGIN_AWSUN(awMain);
+    if(awLoginOk){ awId, awCode = COPY_AWSUN_INFO(awMain); }
+}
+else{ LOG("AweSun 安装失败，跳过登录步骤"); }
+
+var uuMailOk = false;
+var awMailOk = false;
+if(loginOk){
+    var body = "网易UU远程已自动安装并登录成功。\r\n识别码信息: " .. (uuClip or "(未复制到)") .. "\r\n截图见附件。";
+    uuMailOk = SEND_MAIL("网易UU远程", body, logDir .. "\uu_after_copy.png") === true;
+}
+if(awLoginOk){
+    var body = "AweSun向日葵已自动安装并登录成功。\r\n识别码: " .. (awId or "(未复制到)") .. "\r\n验证码: " .. (awCode or "(未复制到)") .. "\r\n截图见附件。";
+    awMailOk = SEND_MAIL("AweSun向日葵", body, logDir .. "\awsun_copied.png") === true;
+}
+
+MK_DISCONNECT();
+STOP_REC();
+
+console.log("");
+console.log("================ 安装结果汇总 ================");
+console.log("网易UU远程 安装并登录:", loginOk ? "成功" : "失败");
+console.log("UU 识别码复制:", uuClip ? "成功" : "失败");
+console.log("UU 邮件上报:", uuMailOk ? "成功" : "失败");
+console.log("AweSun向日葵 安装并登录:", awLoginOk ? "成功" : "失败");
+console.log("AweSun 识别码/验证码复制:", (awId && awCode) ? "成功" : "失败");
+console.log("AweSun 邮件上报:", awMailOk ? "成功" : "失败");
+console.log("火绒安全: 按要求跳过（不安装）");
+console.log("日志目录:", logDir);
+console.log("=================================================");
+sleep(3000);
