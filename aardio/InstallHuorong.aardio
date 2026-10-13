@@ -1,0 +1,296 @@
+﻿import process;
+import process.admin;
+import win;
+import mouse;
+import gdip.snap;
+import gdip.bitmap;
+import time;
+import io;
+import string;
+
+if(!process.admin.isRunAs()){
+	process.execute(io._exepath, , "runas");
+	return;
+}
+
+var root = "D:\SysIns";
+var installer = root + "\Soft\sysdiag-all-x64-6.0.12.1-2026.09.22.1.exe";
+if(!io.exist(installer)){
+	root = io.fullpath("/..");
+	installer = root + "\Soft\sysdiag-all-x64-6.0.12.1-2026.09.22.1.exe";
+}
+var logDir = root + "\Logs";
+io.createDir(logDir);
+var logFile = logDir + "\InstallHuorong-aardio-" + time.format("%Y%m%d%H%M%S") + ".log";
+
+LOG = function(...){
+	var s = time.format("%H:%M:%S  ") + string.join({...}, " ");
+	print(s);
+	var f = io.open(logFile, "a");
+	if(f){ f.write(s + '\r\n'); f.close(); }
+}
+
+SHOT = function(name){
+	try {
+		var bmp = gdip.snap();
+		if(bmp){
+			bmp.save(logDir + "\" + name + ".png");
+			bmp.dispose();
+		}
+	}
+}
+
+var P1 = "C:\Program Files\Huorong\Sysdiag\bin\HipsMain.exe";
+var P2 = "C:\Program Files\Huorong\Sysdiag\bin\HipsDaemon.exe";
+
+IS_ORANGE = function(c){
+	var r = (c >> 16) & 255;
+	var g = (c >> 8) & 255;
+	var b = c & 255;
+	return r >= 200 && g >= 95 && g <= 170 && b <= 80;
+}
+
+IS_BLUE = function(c){
+	var r = (c >> 16) & 255;
+	var g = (c >> 8) & 255;
+	var b = c & 255;
+	return b >= 100 && r <= 130 && g <= 150 && b > r + 20 && b > g + 20;
+}
+
+IS_BTNCOLOR = function(c){
+	return IS_ORANGE(c) || IS_BLUE(c);
+}
+
+FIND_HR_WND = function(timeoutMs){
+	var start = ::Kernel32.GetTickCount();
+	do {
+		var found = null;
+		win.enum(function(h, l){
+			if(win.isVisible(h)){
+				var cls = win.getClass(h) or "";
+				if(string.find(cls, "HUORONGINSTALLERWND")){
+					var r = win.getRect(h);
+					if(r.right - r.left >= 500 && r.bottom - r.top >= 300){
+						found = h;
+						return false;
+					}
+				}
+			}
+		});
+		if(found) return found;
+		if(timeoutMs && ::Kernel32.GetTickCount() - start > timeoutMs) return null;
+		::Kernel32.Sleep(800);
+	} while(true);
+}
+
+FIND_BUTTONS = function(hwnd){
+	var wr = win.getRect(hwnd);
+	var W = wr.right - wr.left;
+	var H = wr.bottom - wr.top;
+	if(W < 10 || H < 10) return {};
+	var bmp = gdip.snap(hwnd);
+	if(!bmp) return {};
+	var data = bmp.lockData32(null, null, 1);
+	if(!data){ bmp.dispose(); return {}; }
+	var rows = data.bits.rows;
+
+	var seen = {};
+	var result = {};
+	for(y = 1; H; 1){
+		for(x = 1; W; 1){
+			var idx = y * W + x;
+			if(seen[idx]) continue;
+			var c = rows[y].pixels[x];
+			if(!IS_BTNCOLOR(c)) continue;
+			var st = {};
+			table.push(st, idx);
+			seen[idx] = true;
+			var cnt = 0;
+			var minX = x; var maxX = x; var minY = y; var maxY = y;
+			while(#st){
+				var cur = table.pop(st);
+				cnt++;
+				var cx = cur % W;
+				var cy = int(cur / W);
+				if(cx == 0){ cx = W; cy = cy - 1; }
+				if(cx < minX) minX = cx;
+				if(cx > maxX) maxX = cx;
+				if(cy < minY) minY = cy;
+				if(cy > maxY) maxY = cy;
+				for(ddy = -1; 1; 1){
+					var ny = cy + ddy;
+					if(ny < 1 || ny > H) continue;
+					for(ddx = -1; 1; 1){
+						var nx = cx + ddx;
+						if(nx < 1 || nx > W) continue;
+						var ni = ny * W + nx;
+						if(seen[ni]) continue;
+						if(IS_BTNCOLOR(rows[ny].pixels[nx])){
+							seen[ni] = true;
+							table.push(st, ni);
+						}
+					}
+				}
+			}
+			var bw = maxX - minX + 1;
+			var bh = maxY - minY + 1;
+			if(bw >= 80 && bw <= 500 && bh >= 25 && bh <= 100 && cnt > bw * bh * 0.4){
+				table.push(result, { X = minX - 1; Y = minY - 1; W = bw; H = bh });
+			}
+		}
+	}
+	bmp.unlockData(data);
+	bmp.dispose();
+	return result;
+}
+
+ENUM_CHILDREN = function(parent){
+	var list = {};
+	var cb = ..raw.tostdcall(function(h, l){
+		var sb = ..raw.buffer(256);
+		::User32.GetClassNameW(h, sb, 256);
+		var cls = ..raw.tostr(sb);
+		var t = win.getText(h) or "";
+		var r = win.getRect(h);
+		table.push(list, { Hwnd = h; Cls = cls; Text = t; R = r });
+		return true;
+	}, "bool(int,int)");
+	::User32.EnumChildWindows(parent, cb, 0);
+	return list;
+}
+
+LOG("================ 火绒安全自动安装(aardio) 开始 ================");
+LOG("安装包:", installer);
+
+if(io.exist(P1)){
+	LOG("火绒安全已安装，无需重复安装");
+	return 0;
+}
+var svcExist = false;
+try {
+	var p = process.popen("sc.exe", "query HipsDaemon");
+	var out = p.readAll();
+	p.close();
+	if(string.find(out, "SERVICE_NAME")) svcExist = true;
+}
+if(svcExist){
+	LOG("火绒安全已安装，无需重复安装");
+	return 0;
+}
+
+process.execute("taskkill.exe", "/f /im sysdiag-all-x64-6.0.12.1-2026.09.22.1.exe");
+process.execute("taskkill.exe", "/f /im Sysdiag_setup.exe");
+
+process.execute(installer);
+
+var hwnd = FIND_HR_WND(90000);
+if(!hwnd){
+	LOG("错误：找不到火绒安装窗口");
+	SHOT("huorong_no_window_aardio");
+	return 1;
+}
+LOG("安装窗口已出现");
+::Kernel32.Sleep(3000);
+
+var best = null;
+var scanStart = ::Kernel32.GetTickCount();
+while(::Kernel32.GetTickCount() - scanStart < 30000){
+	win.showForeground(hwnd);
+	var btns = FIND_BUTTONS(hwnd);
+	if(#btns){
+		for(i = 1; #btns; 1){
+			if(!best || btns[i].W > best.W) best = btns[i];
+		}
+		LOG("检测到安装按钮:", best.W + "x" + best.H);
+		break;
+	}
+	::Kernel32.Sleep(3000);
+}
+
+if(!best){
+	LOG("错误：未检测到极速安装按钮");
+	SHOT("huorong_no_button_aardio");
+	return 1;
+}
+
+var wr = win.getRect(hwnd);
+var cx = int(wr.left + best.X + best.W / 2);
+var cy = int(wr.top + best.Y + best.H / 2);
+win.showForeground(hwnd);
+mouse.click(cx, cy, true);
+LOG("已点击极速安装，等待安装完成...");
+SHOT("huorong_clicked_aardio");
+
+var ok = false;
+var deadline = ::Kernel32.GetTickCount() + 300000;
+while(::Kernel32.GetTickCount() < deadline){
+	::Kernel32.Sleep(5000);
+	if(io.exist(P1) && io.exist(P2)){
+		ok = true;
+		break;
+	}
+}
+
+if(!ok){
+	LOG("错误：安装超时，未检测到火绒主程序");
+SHOT("huorong_timeout_aardio");
+	return 1;
+}
+LOG("检测到火绒主程序文件");
+::Kernel32.Sleep(15000);
+
+process.execute("taskkill.exe", "/f /im sysdiag-all-x64-6.0.12.1-2026.09.22.1.exe");
+process.execute("taskkill.exe", "/f /im Sysdiag_setup.exe");
+::Kernel32.Sleep(3000);
+
+var done = FIND_HR_WND(8000);
+if(done){
+	LOG("检测到安装完成窗口，点击完成并关闭");
+	var btnCenter = null;
+	var children = ENUM_CHILDREN(done);
+	for(i = 1; #children; 1){
+		var ch = children[i];
+		if(string.find(ch.Cls, "Button") && (string.find(ch.Text, "完成") || string.find(ch.Text, "确定"))){
+			btnCenter = { X = ch.R.left + (ch.R.right - ch.R.left) / 2; Y = ch.R.top + (ch.R.bottom - ch.R.top) / 2 };
+			break;
+		}
+	}
+	if(!btnCenter){
+		win.showForeground(done);
+		var btns2 = FIND_BUTTONS(done);
+		if(#btns2){
+			var fb = btns2[1];
+			for(i = 1; #btns2; 1){
+				if(btns2[i].Y > fb.Y) fb = btns2[i];
+			}
+			var dr = win.getRect(done);
+			btnCenter = { X = dr.left + fb.X + fb.W / 2; Y = dr.top + fb.Y + fb.H / 2 };
+			LOG("像素扫描定位完成按钮:", fb.W + "x" + fb.H);
+		}
+	}
+	if(btnCenter){
+		win.showForeground(done);
+		mouse.click(int(btnCenter.X), int(btnCenter.Y), true);
+	}
+	else {
+		LOG("警告：未定位到完成按钮，发送 WM_CLOSE");
+	}
+	::Kernel32.Sleep(2000);
+	::User32.PostMessageW(done, 0x0010, 0, 0);
+	::Kernel32.Sleep(2000);
+	if(FIND_HR_WND(2000) == null){
+		LOG("安装完成窗口已关闭");
+	}
+	else {
+		::User32.PostMessageW(done, 0x0010, 0, 0);
+		::Kernel32.Sleep(2000);
+	}
+}
+
+SHOT("huorong_done_aardio");
+if(io.exist(P1) && io.exist(P2)){
+	LOG("火绒安全安装成功");
+	return 0;
+}
+LOG("警告：主程序文件缺失，请检查");
+return 1;
